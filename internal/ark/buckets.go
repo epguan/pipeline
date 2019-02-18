@@ -26,12 +26,12 @@ import (
 // ValidateCreateBucketRequest validates a CreateBucketRequest
 func ValidateCreateBucketRequest(req *api.CreateBucketRequest, org *auth.Organization) error {
 
-	err := IsProviderSupported(req.Cloud)
+	err := IsProviderSupported(pkgProviders.ProviderID(req.Cloud))
 	if err != nil {
 		return errors.Wrap(err, req.Cloud)
 	}
 
-	if req.Cloud == pkgProviders.Azure {
+	if pkgProviders.ProviderID(req.Cloud) == pkgProviders.Azure {
 		if req.ResourceGroup == "" {
 			return errors.Wrap(errors.New("resourceGroup must not be empty"), "error validating create bucket request")
 		}
@@ -40,13 +40,13 @@ func ValidateCreateBucketRequest(req *api.CreateBucketRequest, org *auth.Organiz
 		}
 	}
 
-	secret, err := GetSecretWithValidation(req.SecretID, org.ID, req.Cloud)
+	secret, err := GetSecretWithValidation(req.SecretID, org.ID, pkgProviders.ProviderID(req.Cloud))
 	if err != nil {
 		return errors.Wrap(err, "error validating create bucket request")
 	}
 
 	ctx := providers.ObjectStoreContext{
-		Provider:       req.Cloud,
+		Provider:       pkgProviders.ProviderID(req.Cloud),
 		Secret:         secret,
 		Location:       req.Location,
 		ResourceGroup:  req.ResourceGroup,

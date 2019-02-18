@@ -23,17 +23,18 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/banzaicloud/pipeline/pkg/providers"
+
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/cloudformation"
 	pipConfig "github.com/banzaicloud/pipeline/config"
 	"github.com/banzaicloud/pipeline/internal/backoff"
 	"github.com/banzaicloud/pipeline/internal/cluster"
-	internalPke "github.com/banzaicloud/pipeline/internal/providers/pke"
+	internalPKE "github.com/banzaicloud/pipeline/internal/providers/pke"
 	"github.com/banzaicloud/pipeline/model"
 	pkgAuth "github.com/banzaicloud/pipeline/pkg/auth"
 	pkgCluster "github.com/banzaicloud/pipeline/pkg/cluster"
-	"github.com/banzaicloud/pipeline/pkg/cluster/pke"
 	"github.com/banzaicloud/pipeline/pkg/common"
 	pkgError "github.com/banzaicloud/pipeline/pkg/errors"
 	pkgSecret "github.com/banzaicloud/pipeline/pkg/secret"
@@ -47,11 +48,14 @@ import (
 	yaml "gopkg.in/yaml.v2"
 )
 
+var _ Cluster = (*EC2ClusterPKE)(nil)
 var _ CommonCluster = (*EC2ClusterPKE)(nil)
+
+const PKEAWS pkgCluster.ClusterType = "pke-aws"
 
 type EC2ClusterPKE struct {
 	db    *gorm.DB
-	model *internalPke.EC2PKEClusterModel
+	model *internalPKE.EC2PKEClusterModel
 	//amazonCluster *ec2.EC2 //Don't use this directly
 	APIEndpoint string
 	log         logrus.FieldLogger
@@ -220,7 +224,8 @@ func (c *EC2ClusterPKE) DeleteFromDatabase() error {
 }
 
 func (c *EC2ClusterPKE) CreateCluster() error {
-	return errors.New("not implemented")
+	_, err := c.Deploy()
+	return err
 }
 
 func (c *EC2ClusterPKE) GetAWSClient() (*session.Session, error) {
@@ -303,32 +308,32 @@ func (c *EC2ClusterPKE) CreatePKECluster(tokenGenerator TokenGenerator, external
 func (c *EC2ClusterPKE) RegisterNode(name, nodePoolName, ip string, master, worker bool) error {
 
 	db := pipConfig.DB()
-	nodePool := internalPke.NodePool{
+	nodePool := internalPKE.NodePool{
 		Name:      nodePoolName,
 		ClusterID: c.GetID(),
 	}
 
-	roles := internalPke.Roles{}
+	roles := internalPKE.Roles{}
 	if master {
-		roles = append(roles, internalPke.RoleMaster)
+		roles = append(roles, internalPKE.RoleMaster)
 	}
 	if worker {
-		roles = append(roles, internalPke.RoleWorker)
+		roles = append(roles, internalPKE.RoleWorker)
 	}
 
-	if err := db.Where(nodePool).Attrs(internalPke.NodePool{
+	if err := db.Where(nodePool).Attrs(internalPKE.NodePool{
 		Roles: roles,
 	}).FirstOrCreate(&nodePool).Error; err != nil {
 		return emperror.Wrap(err, "failed to register nodepool")
 	}
 
-	node := internalPke.Host{
+	node := internalPKE.Host{
 		NodePoolID: nodePool.NodePoolID,
 		Name:       name,
 	}
 
-	if err := db.Where(node).Attrs(internalPke.Host{
-		Labels:    make(internalPke.Labels),
+	if err := db.Where(node).Attrs(internalPKE.Host{
+		Labels:    make(internalPKE.Labels),
 		PrivateIP: ip,
 	}).FirstOrCreate(&node).Error; err != nil {
 		return emperror.Wrap(err, "failed to register node")
@@ -340,11 +345,6 @@ func (c *EC2ClusterPKE) RegisterNode(name, nodePoolName, ip string, master, work
 
 // Create master CF template
 func CreateMasterCF(formation *cloudformation.CloudFormation) error {
-	return nil
-}
-
-func (c *EC2ClusterPKE) ValidateCreationFields(r *pkgCluster.CreateClusterRequest) error {
-	// TODO(Ecsy): implement me
 	return nil
 }
 
@@ -365,8 +365,7 @@ func (c *EC2ClusterPKE) AddDefaultsToUpdate(*pkgCluster.UpdateClusterRequest) {
 }
 
 func (c *EC2ClusterPKE) DeleteCluster() error {
-	// do nothing (the cluster should be left on the provider for now
-	return nil
+	return c.Dispose()
 }
 
 func (c *EC2ClusterPKE) DownloadK8sConfig() ([]byte, error) {
@@ -424,7 +423,7 @@ func (c *EC2ClusterPKE) GetStatus() (*pkgCluster.GetClusterStatusResponse, error
 	hasSpotNodePool := false
 	nodePools := make(map[string]*pkgCluster.NodePoolStatus)
 	for _, np := range c.model.NodePools {
-		providerConfig := internalPke.NodePoolProviderConfigAmazon{}
+		providerConfig := internalPKE.NodePoolProviderConfigAmazon{}
 		err := mapstructure.Decode(np.ProviderConfig, &providerConfig)
 		if err != nil {
 			return nil, emperror.WrapWith(err, "failed to decode providerconfig", "cluster", c.model.Cluster.Name)
@@ -522,10 +521,10 @@ func (c *EC2ClusterPKE) GetBootstrapCommand(nodePoolName, url, token string) str
 	for _, np := range c.model.NodePools {
 		if np.Name == nodePoolName {
 			for _, role := range np.Roles {
-				if role == internalPke.RoleMaster {
+				if role == internalPKE.RoleMaster {
 					cmd = "master"
 					break
-				} else if role == internalPke.RoleWorker {
+				} else if role == internalPKE.RoleWorker {
 					cmd = "worker"
 				}
 			}
@@ -557,46 +556,14 @@ func (c *EC2ClusterPKE) GetBootstrapCommand(nodePoolName, url, token string) str
 		cmd, url, token, c.model.Cluster.OrganizationID, c.model.Cluster.ID, nodePoolName)
 }
 
-func CreateEC2ClusterPKEFromRequest(request *pkgCluster.CreateClusterRequest, orgId pkgAuth.OrganizationID, userId pkgAuth.UserID) (*EC2ClusterPKE, error) {
-	c := &EC2ClusterPKE{
-		log: log.WithField("cluster", request.Name).WithField("organization", orgId),
-	}
-
-	c.db = pipConfig.DB()
-
-	var (
-		network    = createEC2PKENetworkFromRequest(request.Properties.CreateClusterPKE.Network, userId)
-		nodepools  = createEC2ClusterPKENodePoolsFromRequest(request.Properties.CreateClusterPKE.NodePools, userId)
-		kubernetes = createEC2ClusterPKEFromRequest(request.Properties.CreateClusterPKE.Kubernetes, userId)
-		kubeADM    = createEC2ClusterPKEKubeADMFromRequest(request.Properties.CreateClusterPKE.KubeADM, userId)
-		cri        = createEC2ClusterPKECRIFromRequest(request.Properties.CreateClusterPKE.CRI, userId)
-	)
-
-	instanceType, image, err := getMasterInstanceTypeAndImageFromNodePools(nodepools)
-	if err != nil {
-		return nil, err
-	}
-
-	c.model = &internalPke.EC2PKEClusterModel{
-		Cluster: cluster.ClusterModel{
-			Name:           request.Name,
-			Location:       request.Location,
-			Cloud:          request.Cloud,
-			Distribution:   pkgCluster.PKE,
-			OrganizationID: orgId,
-			RbacEnabled:    kubernetes.RBAC.Enabled,
-			CreatedBy:      userId,
-		},
-		MasterInstanceType: instanceType,
-		MasterImage:        image,
-		Network:            network,
-		NodePools:          nodepools,
-		Kubernetes:         kubernetes,
-		KubeADM:            kubeADM,
-		CRI:                cri,
-	}
-
-	return c, nil
+func CreateEC2ClusterPKEFromClusterModel(clusterModel *internalPKE.EC2PKEClusterModel) (*EC2ClusterPKE, error) {
+	db := pipConfig.DB()
+	log := log.WithField("cluster", clusterModel.Cluster.Name).WithField("organization", clusterModel.Cluster.OrganizationID)
+	return &EC2ClusterPKE{
+		db:    db,
+		log:   log,
+		model: clusterModel,
+	}, nil
 }
 
 func CreateEC2ClusterPKEFromModel(modelCluster *model.ClusterModel) (*EC2ClusterPKE, error) {
@@ -604,7 +571,7 @@ func CreateEC2ClusterPKEFromModel(modelCluster *model.ClusterModel) (*EC2Cluster
 
 	db := pipConfig.DB()
 
-	m := internalPke.EC2PKEClusterModel{
+	m := internalPKE.EC2PKEClusterModel{
 		ClusterID: modelCluster.ID,
 	}
 
@@ -630,130 +597,39 @@ func CreateEC2ClusterPKEFromModel(modelCluster *model.ClusterModel) (*EC2Cluster
 	return c, nil
 }
 
-func createEC2ClusterPKENodePoolsFromRequest(pools pke.NodePools, userId pkgAuth.UserID) internalPke.NodePools {
-	var nps internalPke.NodePools
-
-	for _, pool := range pools {
-		np := internalPke.NodePool{
-			Name:           pool.Name,
-			Roles:          convertRoles(pool.Roles),
-			Hosts:          convertHosts(pool.Hosts),
-			Provider:       convertNodePoolProvider(pool.Provider),
-			ProviderConfig: pool.ProviderConfig,
-		}
-		np.CreatedBy = userId
-		nps = append(nps, np)
-	}
-	return nps
+func (c *EC2ClusterPKE) ValidateCreationFields(*pkgCluster.CreateClusterRequest) error {
+	return nil // TODO: obsolete, remove when CommonCluster interface is not supported anymore
 }
 
-func convertRoles(roles pke.Roles) (result internalPke.Roles) {
-	for _, role := range roles {
-		result = append(result, internalPke.Role(role))
-	}
-	return
+func (c *EC2ClusterPKE) Deploy() (bool, error) {
+	panic("implement me")
 }
 
-func convertHosts(hosts pke.Hosts) (result internalPke.Hosts) {
-	for _, host := range hosts {
-		result = append(result, internalPke.Host{
-			Name:             host.Name,
-			PrivateIP:        host.PrivateIP,
-			NetworkInterface: host.NetworkInterface,
-			Roles:            convertRoles(host.Roles),
-			Labels:           convertLabels(host.Labels),
-			Taints:           convertTaints(host.Taints),
-		})
-	}
-
-	return
+func (c *EC2ClusterPKE) Dispose() error {
+	// do nothing (the cluster should be left on the provider for now
+	return nil
 }
 
-func convertNodePoolProvider(provider pke.NodePoolProvider) (result internalPke.NodePoolProvider) {
-	return internalPke.NodePoolProvider(provider)
+func (c *EC2ClusterPKE) GetCreationTime() time.Time {
+	return c.model.Cluster.CreatedAt
 }
 
-func convertLabels(labels pke.Labels) internalPke.Labels {
-	res := make(internalPke.Labels, len(labels))
-	for k, v := range labels {
-		res[k] = v
-	}
-	return res
+func (c *EC2ClusterPKE) GetDistributionID() pkgCluster.DistributionID {
+	return pkgCluster.PKE
 }
 
-func convertTaints(taints pke.Taints) (result internalPke.Taints) {
-	for _, taint := range taints {
-		result = append(result, internalPke.Taint(taint))
-	}
-	return
+func (c *EC2ClusterPKE) GetOrganizationID() pkgAuth.OrganizationID {
+	return c.model.Cluster.OrganizationID
 }
 
-func createEC2PKENetworkFromRequest(network pke.Network, userId pkgAuth.UserID) internalPke.Network {
-	n := internalPke.Network{
-		ServiceCIDR:      network.ServiceCIDR,
-		PodCIDR:          network.PodCIDR,
-		Provider:         convertNetworkProvider(network.Provider),
-		APIServerAddress: network.APIServerAddress,
-	}
-	n.CreatedBy = userId
-	return n
+func (c *EC2ClusterPKE) GetProviderID() providers.ProviderID {
+	return providers.Amazon
 }
 
-func convertNetworkProvider(provider pke.NetworkProvider) (result internalPke.NetworkProvider) {
-	return internalPke.NetworkProvider(provider)
+func (c *EC2ClusterPKE) GetType() pkgCluster.ClusterType {
+	return PKEAWS
 }
 
-func createEC2ClusterPKEFromRequest(kubernetes pke.Kubernetes, userId pkgAuth.UserID) internalPke.Kubernetes {
-	k := internalPke.Kubernetes{
-		Version: kubernetes.Version,
-		RBAC:    internalPke.RBAC{Enabled: kubernetes.RBAC.Enabled},
-	}
-	k.CreatedBy = userId
-	return k
-}
-
-func createEC2ClusterPKEKubeADMFromRequest(kubernetes pke.KubeADM, userId pkgAuth.UserID) internalPke.KubeADM {
-	a := internalPke.KubeADM{
-		ExtraArgs: convertExtraArgs(kubernetes.ExtraArgs),
-	}
-	a.CreatedBy = userId
-	return a
-}
-
-func convertExtraArgs(extraArgs pke.ExtraArgs) internalPke.ExtraArgs {
-	res := make(internalPke.ExtraArgs, len(extraArgs))
-	for k, v := range extraArgs {
-		res[k] = internalPke.ExtraArg(v)
-	}
-	return res
-}
-
-func createEC2ClusterPKECRIFromRequest(cri pke.CRI, userId pkgAuth.UserID) internalPke.CRI {
-	c := internalPke.CRI{
-		Runtime:       internalPke.Runtime(cri.Runtime),
-		RuntimeConfig: cri.RuntimeConfig,
-	}
-	c.CreatedBy = userId
-	return c
-}
-
-func getMasterInstanceTypeAndImageFromNodePools(nodepools internalPke.NodePools) (masterInstanceType string, masterImage string, err error) {
-	for _, nodepool := range nodepools {
-		for _, role := range nodepool.Roles {
-			if role == internalPke.RoleMaster {
-				switch nodepool.Provider {
-				case internalPke.NPPAmazon:
-					providerConfig := internalPke.NodePoolProviderConfigAmazon{}
-					err = mapstructure.Decode(nodepool.ProviderConfig, &providerConfig)
-					if err != nil {
-						return
-					}
-					masterInstanceType = providerConfig.AutoScalingGroup.InstanceType
-					masterImage = providerConfig.AutoScalingGroup.Image
-					return
-				}
-			}
-		}
-	}
-	return
+func (c *EC2ClusterPKE) GetUUID() string {
+	return c.model.Cluster.UID
 }
